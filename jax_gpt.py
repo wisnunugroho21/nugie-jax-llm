@@ -11,7 +11,6 @@ import jax.random as random
 import numpy as np
 import optax
 import tiktoken
-from flax.nnx.training.metrics import Average
 
 tokenizer = tiktoken.get_encoding("gpt2")
 vocab_size = tokenizer.n_vocab
@@ -86,8 +85,6 @@ class GroupedQueryAttention(nnx.Module):
 
         # Scaling factor
         self.scale = jnp.sqrt(self.head_dim)
-
-        # Attention mask
 
     def __call__(self, x: jax.Array, mask: jax.Array | None = None) -> jax.Array:
         batch_size, seq_length, _ = x.shape
@@ -220,6 +217,8 @@ class GPT2(nnx.Module):
         dropout_rate: float,
         rngs: nnx.Rngs,
     ) -> None:
+        self.seqlen = seqlen
+
         self.embedding_layer = TokenAndPositionEmbedding(
             seqlen, vocab_size, embed_dim, rngs=rngs
         )
@@ -240,9 +239,6 @@ class GPT2(nnx.Module):
         )
 
         self.layer_norm = nnx.LayerNorm(epsilon=1e-6, num_features=embed_dim, rngs=rngs)
-
-        self.tokenizer = tiktoken.get_encoding("gpt2")
-        self.seqlen = seqlen
 
     def __call__(self, x: jax.Array, is_training: bool = True) -> jax.Array:
         token_embed, x = self.embedding_layer(x)
@@ -272,7 +268,8 @@ class GPT2(nnx.Module):
 
     def generate_text(self, max_token: int, start_tokens: list[int]) -> str:
         generated = []
-        print(self.tokenizer.decode(start_tokens), flush=True, end="")
+        print(tokenizer.decode(start_tokens), flush=True, end="")
+
         for i in range(max_token):
             sample_index = len(start_tokens) + len(generated) - 1
             # TODO: use attention masking for better efficiency
@@ -283,18 +280,20 @@ class GPT2(nnx.Module):
                     + [0] * (seqlen - len(start_tokens) - len(generated))
                 )
             )[None, :]
+
             next_token = int(self.generate_step(padded_tokens, sample_index))
             if (
                 next_token
-                == self.tokenizer.encode(
-                    "<|endoftext|>", allowed_special={"<|endoftext|>"}
-                )[0]
+                == tokenizer.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})[
+                    0
+                ]
             ):
                 break
             generated.append(next_token)
             # decode and print next_token
-            print(self.tokenizer.decode([next_token]), flush=True, end="")
-        return self.tokenizer.decode(start_tokens + generated)
+            print(tokenizer.decode([next_token]), flush=True, end="")
+
+        return tokenizer.decode(start_tokens + generated)
 
 
 @nnx.jit
@@ -313,7 +312,7 @@ def loss_fn(
 def train_step(
     model: GPT2,
     optimizer: nnx.ModelAndOptimizer,
-    metrics: Average,
+    metrics: nnx.training.metrics.Average,
     batch: tuple[jax.Array, jax.Array],
 ) -> None:
 
@@ -368,10 +367,8 @@ val_metrics = nnx.metrics.Average("val_loss")
 
 rng = jax.random.PRNGKey(0)
 
-# start_prompt = "Once upon a time"
-# start_tokens = tokenizer.encode(start_prompt)[:seqlen]
-# print(f"Initial generated text:")
-# generated_text = model.generate_text(seqlen // 10, start_tokens)
+start_prompt = "Once upon a time"
+start_tokens = tokenizer.encode(start_prompt)[:seqlen]
 
 metrics_history = {"train_loss": [], "val_loss": []}
 
