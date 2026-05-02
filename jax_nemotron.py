@@ -1,65 +1,9 @@
 import jax
 import jax.numpy as jnp
-import numpy as np
-import torch
-import torch.nn.functional as F
 from einops import rearrange
 
 
-def torch_segsum(x):
-    """Naive segment sum calculation. exp(segsum(A)) produces a 1-SS matrix,
-    which is equivalent to a scalar SSM."""
-    T = x.size(-1)
-    x_cumsum = torch.cumsum(x, dim=-1)
-    x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
-    mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
-    x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
-    return x_segsum
-
-
-def torch_ssd(X, A, B, C, block_len=64, initial_states=None):
-    """
-    Arguments:
-    X: (batch, length, n_heads, d_head)
-    A: (batch, length, n_heads)
-    B: (batch, length, n_heads, d_state)
-    C: (batch, length, n_heads, d_state)
-    Return:
-    Y: (batch, length, n_heads, d_head)
-    """
-    assert X.dtype == A.dtype == B.dtype == C.dtype
-    assert X.shape[1] % block_len == 0
-    # Rearrange into blocks/chunks
-    X, A, B, C = [
-        rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)
-    ]
-    A = rearrange(A, "b c l h -> b h c l")
-    A_cumsum = torch.cumsum(A, dim=-1)
-    # 1. Compute the output for each intra-chunk (diagonal blocks)
-    L = torch.exp(torch_segsum(A))
-    Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
-    # 2. Compute the state for each intra-chunk
-    # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
-    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
-    # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
-    # (middle term of factorization of off-diag blocks; A terms)
-    if initial_states is None:
-        initial_states = torch.zeros_like(states[:, :1])
-    states = torch.cat([initial_states, states], dim=1)
-    decay_chunk = torch.exp(torch_segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-    new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
-    states, final_state = new_states[:, :-1], new_states[:, -1]
-    # 4. Compute state -> output conversion per chunk
-    # (left term of low-rank factorization of off-diagonal blocks; C terms)
-    state_decay_out = torch.exp(A_cumsum)
-    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
-    # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-    return Y, final_state
-
-
-def jax_segsum(x: jax.Array) -> jax.Array:
+def segsum(x: jax.Array) -> jax.Array:
     """Naive segment sum calculation. exp(segsum(A)) produces a 1-SS matrix,
     which is equivalent to a scalar SSM."""
     T = x.shape[-1]
@@ -71,7 +15,7 @@ def jax_segsum(x: jax.Array) -> jax.Array:
     return x_segsum
 
 
-def jax_ssd(
+def ssd(
     X: jax.Array,
     A: jax.Array,
     B: jax.Array,
@@ -100,7 +44,7 @@ def jax_ssd(
     A_cumsum = jnp.cumsum(A, axis=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
-    L = jnp.exp(jax_segsum(A))
+    L = jnp.exp(segsum(A))
     Y_diag = jnp.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
 
     # 2. Compute the state for each intra-chunk
@@ -114,7 +58,7 @@ def jax_ssd(
         initial_states = jnp.zeros_like(states[:, :1])
     states = jnp.concatenate([initial_states, states], axis=1)
     decay_chunk = jnp.exp(
-        jax_segsum(jnp.pad(A_cumsum[:, :, :, -1], ((0, 0), (0, 0), (1, 0))))
+        segsum(jnp.pad(A_cumsum[:, :, :, -1], ((0, 0), (0, 0), (1, 0))))
     )
     new_states = jnp.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
@@ -128,36 +72,3 @@ def jax_ssd(
     Y = rearrange(Y_diag + Y_off, "b c l h p-> b (c l) h p")
 
     return Y, final_state
-
-
-batch = 128
-length = 64
-n_heads = 4
-d_head = 8
-d_state = 16
-
-rng = np.random.default_rng()
-
-X = rng.random((batch, length, n_heads, d_head))
-A = rng.random((batch, length, n_heads))
-B = rng.random((batch, length, n_heads, d_state))
-C = rng.random((batch, length, n_heads, d_state))
-
-torch_X = torch.from_numpy(X)
-torch_A = torch.from_numpy(A)
-torch_B = torch.from_numpy(B)
-torch_C = torch.from_numpy(C)
-
-torch_Y, _ = torch_ssd(torch_X, torch_A, torch_B, torch_C)
-
-jax_X = jnp.asarray(X)
-jax_A = jnp.asarray(A)
-jax_B = jnp.asarray(B)
-jax_C = jnp.asarray(C)
-
-jax_Y, _ = jax_ssd(jax_X, jax_A, jax_B, jax_C)
-
-numpy_torch_Y = torch_Y.numpy()
-numpy_jax_Y = np.asarray(jax_Y)
-
-print(np.allclose(numpy_torch_Y, numpy_jax_Y))
